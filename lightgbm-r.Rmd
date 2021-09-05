@@ -1,0 +1,280 @@
+---
+title: 'lightGBM-R'
+author: 'Peter Hahn'
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    toc: true
+---
+
+# LightGBM for R
+Basic script for implimentation of LightGBM including metrics for this competition
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lightgbm)
+library(GGally)
+library(MLmetrics)
+library(arrow)
+library(rsample)
+```
+
+## Data loading and preprocessing
+Feel free to experiment with the features. Only part of them are included in the final model
+```{r loadtrainbook}
+set.seed(123)
+vol_df <- tibble(time_id = numeric(),
+                 volat = numeric(),
+                 volat2 = numeric(),
+                 sd_bp1 = numeric(),
+                 sd_ap1 = numeric(),
+                 min_bp1 = numeric(),
+                 min_ap1 = numeric(),
+                 log_ret = numeric(),
+                 log_ret2 = numeric(),
+                 stock_id = numeric(),
+                 price_spread = numeric(),
+                 volume = numeric(),
+                 imbalance = numeric()
+                 )
+
+## list with file names full.names and recursive to get all files within the directories
+file_list <- list.files("./input/optiver-realized-volatility-prediction/book_train.parquet/", full.names = TRUE, all.files = FALSE, recursive = TRUE)
+## list with names of directories. Used to convientently get the stock_id
+
+file_names <- list.files("./input/optiver-realized-volatility-prediction/book_train.parquet/")
+
+for (i in 1:length(file_list)){
+        stock <- read_parquet(file_list[i])
+        stock <- stock %>% mutate(wap= (bid_price1 * ask_size1 +ask_price1 * bid_size1) / (
+                                       bid_size1 + ask_size1)) %>% 
+                                        mutate(log_return = log(wap/lag(wap))) %>% 
+                                        mutate(wap2= (bid_price2 * ask_size2 +ask_price2 * bid_size2) / (
+                                       bid_size2 + ask_size2)) %>% 
+                                        mutate(log_return2 = log(wap2/lag(wap2))) %>% 
+                                        mutate(spread = ask_price1 - bid_price1) %>% 
+                                        mutate(vol = ask_size1 + bid_size1) %>% 
+                                        mutate(imb = ask_size1 - bid_size1)  %>% 
+                                        group_by(time_id) %>%
+                                        mutate(volat=sqrt(sum(diff(log((bid_price1 * ask_size1 + ask_price1 * bid_size1) 
+                                                                        / (ask_size1 + bid_size1)))**2))) %>% 
+                                        mutate(volat2=sqrt(sum(diff(log((bid_price2 * ask_size2 + ask_price2 * bid_size2) 
+                                                                        / (ask_size2 + bid_size2)))**2))) %>%
+                                                 summarize(sd_bp1 = mean(bid_price1),
+                                                           min_bp1 = min(bid_price1),
+                                                  sd_ap1 = sd(ask_price1),
+                                                  min_ap1 = sd(ask_price1),
+                                                  log_ret = mean(log_return),
+                                                  log_ret2 = mean(log_return2),
+                                                  volat = mean(volat),
+                                                  volat2 = mean(volat2),
+                                                  price_spread = mean(spread),
+                                                  volume = mean(vol),
+                                                  imbalance = mean(imb)
+                                                  )
+
+        ## add stock_id to rows
+        stock <- stock %>% mutate(stock_id = as.numeric(str_sub(file_names[i],10)))
+        vol_df <- vol_df %>% add_row(stock)
+}
+vol_df <- vol_df %>% filter(!is.na(log_ret)) %>% filter(!is.na(log_ret2))
+```
+
+### Load train and bind to features dataframe
+```{r load-train}
+train <- read_csv('../input/optiver-realized-volatility-prediction/train.csv')
+vol_df <- left_join(vol_df, train ,by=c("stock_id","time_id"))
+```
+
+## Poly function 
+```{r func_poly}
+polyT=function(x,y){
+polYi=matrix(0, length(x),3)
+polYi[,1]=x
+polYi[,2]=x**2
+polYi[,3]=x**3    
+colnames(polYi)=paste0(y, 1:3)
+return(data.frame(polYi))
+}
+```
+
+```{r}
+poli <- polyT(vol_df$volat,"vola")
+poli2 <- polyT(vol_df$volat2,"vola2" )
+vol_df <- bind_cols(vol_df,poli,poli2)# %>% select(stock_id,target,var1,var2,var3)
+```
+
+
+If working locally save vol_df for further processing and reload by read
+```{r eval = FALSE}
+#write_csv(vol_df,"vol_df.csv")
+vol_df <- read_csv("vol_df_main.csv")
+```
+
+## for first use only few variables
+```{r}
+vol_df_part <- vol_df %>% select(stock_id,time_id,target,log_ret,log_ret2,
+                                 volat, volat2, volume, imbalance, price_spread, vola1, vola2, vola3 )
+```
+
+
+### strata on stock_id to get a good mix
+```{r split-data}
+set.seed(1234)
+vol_df_split <- vol_df_part  %>% 
+        initial_split(strata = stock_id)
+        
+df_train <- training(vol_df_split)
+df_test <- testing(vol_df_split)
+```
+#LightGBM
+## Prepare data for lgb
+Building matrix and lgb dataset
+```{r}
+X_train <- df_train %>% select(-target) %>% as.matrix()
+x_label <- df_train$target
+Y_train <- df_test %>% select(-target) %>% as.matrix()
+y_label <- df_test$target
+
+vol_lgb <- lgb.Dataset(X_train, label = x_label, weight = 1/(x_label**2))
+vol_lgb_test <- lgb.Dataset(Y_train, label = y_label, weight = 1/(y_label**2))
+```
+
+## define metrics functions
+```{r}
+lgb.RMSPE <- function(preds, vol_lgb){
+    label <- getinfo(vol_lgb, "label")
+    val <- sqrt(mean(((label - preds)/label)^2))
+    return(list(name = "RMSPE", value = val, higher_better = FALSE))
+    }
+```
+
+### grid parameters 
+```{r}
+lgb.grid = list(objective = "regression",
+                boosting_type = "gbdt",
+                metric = "lgb.RMSPE",
+                min_sum_hessian_in_leaf = 1,
+                feature_fraction = 0.7,
+                bagging_fraction = 0.7,
+                bagging_freq = 5,
+                lambda_l2 = 1
+        )
+```
+
+### cv- model 
+```{r eval = FALSE}
+lgb.model.cv <- lgb.cv(params = lgb.grid, data = vol_lgb, learning_rate = 0.02,  num_threads = 6, 
+                       nrounds = 8000, early_stopping_rounds = 50, eval_freq = 20, eval = lgb.RMSPE, nfolds= n_folds)
+```
+
+### Final model with 
+```{r}
+lgb.model = lgb.train(params = lgb.grid,
+                      data = vol_lgb,
+                      learning_rate = 0.02,
+                      num_leaves = 25,
+                      num_threads = 2,
+                      nrounds = 1081,
+                      eval_freq = 20,
+                      eval = lgb.RMSPE,
+                      num_threads = 6)
+
+
+```
+
+# Prepare submission
+```{r load-data}
+set.seed(123)
+vol_df_test <- tibble(time_id = numeric(),
+                 volat = numeric(),
+                 volat2 = numeric(),
+                 sd_bp1 = numeric(),
+                 sd_ap1 = numeric(),
+                 min_bp1 = numeric(),
+                 min_ap1 = numeric(),
+                 log_ret = numeric(),
+                 log_ret2 = numeric(),
+                 stock_id = numeric(),
+                 price_spread = numeric(),
+                 volume = numeric(),
+                 imbalance = numeric()
+                 )
+
+## list with file names full.names and recursive to get all files within the directories
+file_list <- list.files("../input/optiver-realized-volatility-prediction/book_test.parquet/", 
+                        full.names = TRUE, all.files = FALSE, recursive = TRUE)
+## list with names of directories. Used to convientently get the stock_id
+
+file_names <- list.files("../input/optiver-realized-volatility-prediction/book_test.parquet/")
+
+for (i in 1:length(file_list)){
+        stock <- read_parquet(file_list[i])
+         stock <- stock %>% mutate(wap= (bid_price1 * ask_size1 +ask_price1 * bid_size1) / (
+                                       bid_size1 + ask_size1)) %>% 
+                                        mutate(log_return = log(wap/lag(wap))) %>% 
+                                        mutate(wap2= (bid_price2 * ask_size2 +ask_price2 * bid_size2) / (
+                                       bid_size2 + ask_size2)) %>% 
+                                        mutate(log_return2 = log(wap2/lag(wap2))) %>% 
+                                        mutate(spread = ask_price1 - bid_price1) %>% 
+                                        mutate(vol = ask_size1 + bid_size1) %>% 
+                                        mutate(imb = ask_size1 - bid_size1)  %>% 
+                                        filter(!is.na(log_return)) %>% 
+                                        filter(!is.na(log_return2))  %>%     
+                                        group_by(time_id) %>%
+                                        mutate(volat=sqrt(sum(diff(log((bid_price1 * ask_size1 + ask_price1 * bid_size1) 
+                                                                        / (ask_size1 + bid_size1)))**2))) %>% 
+                                        mutate(volat2=sqrt(sum(diff(log((bid_price2 * ask_size2 + ask_price2 * bid_size2) 
+                                                                        / (ask_size2 + bid_size2)))**2))) %>%
+                                                 summarize(sd_bp1 = mean(bid_price1),
+                                                           min_bp1 = min(bid_price1),
+                                                  sd_ap1 = sd(ask_price1),
+                                                  min_ap1 = sd(ask_price1),
+                                                  log_ret = mean(log_return),
+                                                  log_ret2 = mean(log_return2),
+                                                  volat = mean(volat),
+                                                  volat2 = mean(volat2),
+                                                  price_spread = mean(spread),
+                                                  volume = mean(vol),
+                                                  imbalance = mean(imb)
+                                                  )
+        ## add stock_id to rows
+        stock <- stock %>% mutate(stock_id = as.numeric(str_sub(file_names[i],10)))
+        vol_df_test <- vol_df_test %>% add_row(stock)
+}
+#vol_df_test <- vol_df_test %>% filter(!is.na(log_ret)) %>% filter(!is.na(log_ret2))
+```
+
+### standardize volume and imbalance
+
+```{r}
+vol_df_test <- vol_df_test %>% mutate(volume = (volume -mean(volume))/sd(volume)) %>% 
+    mutate(imbalance = (imbalance - mean(imbalance))/sd(imbalance))
+```
+
+```{r}
+poli <- polyT(vol_df_test$volat,"vola")
+poli2 <- polyT(vol_df_test$volat2,"vola2" )
+```
+
+```{r}
+vol_df_test <- bind_cols(vol_df_test,poli,poli2)# %>% select(stock_id,target,var1,var2,var3)
+```
+
+```{r}
+vol_df_test <- vol_df_test %>% select(stock_id,time_id,log_ret,log_ret2,
+                                 volat, volat2, volume, imbalance, price_spread, vola1, vola2, vola3 )
+```
+
+```{r make_prediction}
+vol_df_mat <- vol_df_test %>% as.matrix()
+pred <- predict(lgb.model, vol_df_mat)
+vol_df_test$target <- pred 
+vol_df_test <- vol_df_test %>% mutate(row_id = str_c(stock_id,"-",time_id))%>% select(row_id,target)
+write_csv(vol_df_test,"submission.csv")
+```
+
