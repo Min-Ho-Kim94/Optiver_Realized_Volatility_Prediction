@@ -43,26 +43,26 @@ stock_id <- sort(unique(train$stock_id))
 
 
 
-# #2 book
-# book_train <- map(as.list(1:length(path_book_train)),
-#                   ~setDT(read_parquet(file = path_book_train[.x])))
-# names(book_train) <- stock_id
-# # rbindlist(book_train, idcol = "stock_id")
-# 
-# book_test <- setDT(read_parquet(file = path_book_test))
-# book_test$stock_id <- 0
-# 
-# 
-# 
-# #3 trade
-# trade_train <- map(as.list(1:length(path_book_train)), 
-#                    ~setDT(read_parquet(file = path_trade_train[.x])))
-# names(trade_train) <- stock_id
-# # rbindlist(trade_train, idcol = "stock_id")
-# 
-# 
-# trade_test <- setDT(read_parquet(file = path_trade_test))
-# trade_test$stock_id <- 0
+#2 book
+book_train <- map(as.list(1:2),
+                  ~setDT(read_parquet(file = path_book_train[.x])))
+names(book_train) <- stock_id[1:2]
+book_train <- rbindlist(book_train, idcol = "stock_id")
+
+book_test <- setDT(read_parquet(file = path_book_test))
+book_test$stock_id <- 0
+
+
+
+#3 trade
+trade_train <- map(as.list(1:2),
+                   ~setDT(read_parquet(file = path_trade_train[.x])))
+names(trade_train) <- stock_id[1:2]
+trade_train <- rbindlist(trade_train, idcol = "stock_id")
+
+
+trade_test <- setDT(read_parquet(file = path_trade_test))
+trade_test$stock_id <- 0
 
 
 
@@ -70,43 +70,50 @@ stock_id <- sort(unique(train$stock_id))
 
 # 2. explore ---------------------------------------------------------------
 
-trade_train[[1]] %>% 
-  group_by(time_id) %>% 
-  summarize(sdp = sd(price))
+## trade ----
+trade_train[, .("sd" = sd(price)), c("time_id", "stock_id")]
+
+
+
+
+## book -----
+book_train %>% head()
 
 
 
 
 
-
-
-for (i in 1:length(path_book_train)){
+for (i in 1:length(path_book_train)) {
   stock <- read_parquet(path_book_train[i])
-  stock <- stock %>% mutate(wap= (bid_price1 * ask_size1 +ask_price1 * bid_size1) / (
-    bid_size1 + ask_size1)) %>% 
-    mutate(log_return = log(wap/lag(wap))) %>% 
-    mutate(wap2= (bid_price2 * ask_size2 +ask_price2 * bid_size2) / (
-      bid_size2 + ask_size2)) %>% 
-    mutate(log_return2 = log(wap2/lag(wap2))) %>% 
-    mutate(spread = ask_price1 - bid_price1) %>% 
-    mutate(vol = ask_size1 + bid_size1) %>% 
-    mutate(imb = ask_size1 - bid_size1)  %>% 
+  stock1 <- stock %>%
+    mutate(wap = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1)) %>%
+    mutate(log_return = log(wap / lag(wap))) %>%
+    mutate(wap2 = (bid_price2 * ask_size2 + ask_price2 * bid_size2) / (bid_size2 + ask_size2)) %>%
+    mutate(log_return2 = log(wap2 / lag(wap2))) %>%
+    mutate(spread = ask_price1 - bid_price1) %>%
+    mutate(vol = ask_size1 + bid_size1) %>%
+    mutate(imb = ask_size1 - bid_size1)
+  
+  stock2 <- stock1 %>%
     group_by(time_id) %>%
-    mutate(volat=sqrt(sum(diff(log((bid_price1 * ask_size1 + ask_price1 * bid_size1) 
-                                   / (ask_size1 + bid_size1)))**2))) %>% 
-    mutate(volat2=sqrt(sum(diff(log((bid_price2 * ask_size2 + ask_price2 * bid_size2) 
-                                    / (ask_size2 + bid_size2)))**2))) %>%
-    summarize(sd_bp1 = mean(bid_price1),
-              min_bp1 = min(bid_price1),
-              sd_ap1 = sd(ask_price1),
-              min_ap1 = sd(ask_price1),
-              log_ret = mean(log_return),
-              log_ret2 = mean(log_return2),
-              volat = mean(volat),
-              volat2 = mean(volat2),
-              price_spread = mean(spread),
-              volume = mean(vol),
-              imbalance = mean(imb)
+    mutate(volat = sqrt(sum(diff(log((bid_price1 * ask_size1 + ask_price1 * bid_size1)
+                                     / (ask_size1 + bid_size1)
+    )) ** 2))) %>%
+    mutate(volat2 = sqrt(sum(diff(log((bid_price2 * ask_size2 + ask_price2 * bid_size2)
+                                      / (ask_size2 + bid_size2)
+    )) ** 2))) %>%
+    summarize(
+      sd_bp1 = mean(bid_price1),
+      min_bp1 = min(bid_price1),
+      sd_ap1 = sd(ask_price1),
+      min_ap1 = sd(ask_price1),
+      log_ret = mean(log_return),
+      log_ret2 = mean(log_return2),
+      volat = mean(volat),
+      volat2 = mean(volat2),
+      price_spread = mean(spread),
+      volume = mean(vol),
+      imbalance = mean(imb)
     )
   
   ## add stock_id to rows
@@ -117,7 +124,7 @@ for (i in 1:length(path_book_train)){
 
 
 
-
+wap_ex <- (147 * 221 + 148 * 251)/(251 + 221)
 
 
 
